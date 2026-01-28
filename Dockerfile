@@ -12,9 +12,11 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python packages
+# Install Python packages in correct order (torch first, then flash-attn)
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir torch==2.4.0 && \
+    pip install --no-cache-dir transformers accelerate pillow huggingface_hub protobuf "numpy<2.0" runpod && \
+    pip install --no-cache-dir flash-attn --no-build-isolation
 
 # Create models directory and download model during build
 RUN mkdir -p /models/hf && \
