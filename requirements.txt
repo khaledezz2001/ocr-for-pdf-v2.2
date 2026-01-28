@@ -7,3 +7,4 @@ protobuf>=4.25.0
 numpy<2.0
 runpod>=1.6.0
 flash-attn>=2.5.0
+pdf2image>=1.16.0
