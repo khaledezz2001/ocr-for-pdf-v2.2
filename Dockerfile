@@ -3,10 +3,11 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for building flash-attention
+# Install system dependencies for building flash-attention and PDF processing
 RUN apt-get update && apt-get install -y \
     git \
     ninja-build \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -15,7 +16,7 @@ COPY requirements.txt .
 # Install Python packages in correct order (torch first, then flash-attn)
 RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir torch==2.4.0 && \
-    pip install --no-cache-dir transformers accelerate pillow huggingface_hub protobuf "numpy<2.0" runpod && \
+    pip install --no-cache-dir transformers accelerate pillow huggingface_hub protobuf "numpy<2.0" runpod pdf2image && \
     pip install --no-cache-dir flash-attn --no-build-isolation
 
 # Create models directory and download model during build
