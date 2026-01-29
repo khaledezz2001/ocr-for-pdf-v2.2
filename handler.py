@@ -23,7 +23,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # MEMORY OPTIMIZATION
 # ===============================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# 🔹 ADDED (safe on 4090, REQUIRED on 5090)
+# Required for RTX 5090, harmless for 4090
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
 # ===============================
@@ -37,15 +37,15 @@ processor = None
 model = None
 
 # ===============================
-# GPU DETECTION (ADDED)
+# GPU DETECTION (LOW-LEVEL ONLY)
 # ===============================
-def get_gpu_capability():
+def get_gpu_major():
     if not torch.cuda.is_available():
         return None
-    major, minor = torch.cuda.get_device_capability()
+    major, _ = torch.cuda.get_device_capability()
     return major
 
-GPU_MAJOR = get_gpu_capability()
+GPU_MAJOR = get_gpu_major()
 
 # ===============================
 # RTX OPTIMIZATIONS (SAFE)
@@ -55,7 +55,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    # 🔹 ADDED: disable unstable kernels on RTX 5090
+    # RTX 5090 (Blackwell) stability
     if GPU_MAJOR and GPU_MAJOR >= 9:
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -74,9 +74,9 @@ def log(msg):
 def is_hallucinated_output(text: str) -> bool:
     if not text or len(text.strip()) < 10:
         return True
-    
+
     text_lower = text.lower()
-    
+
     hallucination_indicators = [
         "table 1:",
         "comparison of different methods",
@@ -92,36 +92,36 @@ def is_hallucinated_output(text: str) -> bool:
         "soil moisture",
         "time domain reflectometry"
     ]
-    
+
     for indicator in hallucination_indicators:
         if indicator in text_lower:
             return True
-    
+
     lines = text.strip().split('\n')
     if len(lines) > 20:
         unique_lines = set(line.strip() for line in lines if line.strip())
         if len(unique_lines) < 3:
             return True
-    
+
     table_markers = text.count('|')
     pipe_lines = sum(1 for line in lines if '|' in line)
-    
+
     if len(lines) > 0 and pipe_lines / len(lines) > 0.5:
         content_without_pipes = text.replace('|', '').replace('-', '').replace('\n', '').strip()
         if len(content_without_pipes) < 100:
             return True
-    
+
     if table_markers > 10:
         table_rows = [line for line in lines if '|' in line]
         if len(table_rows) > 3:
             pipe_counts = [line.count('|') for line in table_rows]
             if len(set(pipe_counts)) == 1 and pipe_counts[0] > 3:
                 return True
-    
+
     alphanumeric_chars = sum(c.isalnum() for c in text)
     if alphanumeric_chars < 10:
         return True
-    
+
     return False
 
 
@@ -164,7 +164,7 @@ def load_model():
         local_files_only=True
     )
 
-    # 🔹 ONLY CHANGE: dtype auto-select (NO logic change)
+    # ONLY hardware-adaptive change
     dtype = torch.bfloat16 if GPU_MAJOR and GPU_MAJOR >= 9 else torch.float16
 
     log("Loading model...")
@@ -175,6 +175,13 @@ def load_model():
         local_files_only=True,
         low_cpu_mem_usage=True
     )
+
+    # RTX 5090: force stable attention (MODEL LEVEL, not generate)
+    if GPU_MAJOR and GPU_MAJOR >= 9:
+        try:
+            model.config.attn_implementation = "eager"
+        except Exception:
+            pass
 
     model.eval()
     log("RolmOCR model loaded")
@@ -236,8 +243,6 @@ def ocr_page(image: Image.Image) -> str:
             num_beams=1,
             repetition_penalty=1.1,
             use_cache=True,
-            # 🔹 ADDED: stable attention on 5090, harmless on 4090
-            attn_implementation="eager",
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id
         )
@@ -256,13 +261,13 @@ def ocr_page(image: Image.Image) -> str:
 
 
 # ===============================
-# HANDLER (UNCHANGED)
+# HANDLER
 # ===============================
 def handler(event):
     load_model()
 
     PREFIX =".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n\nCRITICAL RULES:\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\n- Do NOT make up content if the page is blank or empty\n- If the page is truly empty, output only: EMPTY_PAGE\n- Do NOT create tables, examples, or sample data\n\nReturn ONLY the extracted text, nothing else.\nassistant\n"
-    
+
     try:
         if "image" in event["input"]:
             pages = [decode_image(event["input"]["image"])]
@@ -299,7 +304,7 @@ def handler(event):
 
 
 # ===============================
-# PRELOAD & WARMUP (UNCHANGED)
+# PRELOAD & WARMUP
 # ===============================
 log("Preloading model...")
 load_model()
