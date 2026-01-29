@@ -1,49 +1,67 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
-# Set working directory
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# Install system dependencies for building flash-attention and PDF processing
-RUN apt-get update && apt-get install -y \
-    git \
-    ninja-build \
-    poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements first for better caching
-COPY requirements.txt .
-
-# Install Python packages in correct order (torch first, then flash-attn)
-RUN pip install --no-cache-dir -U pip setuptools wheel && \
-    pip install --no-cache-dir torch==2.4.0 && \
-    pip install --no-cache-dir transformers accelerate pillow huggingface_hub protobuf "numpy<2.0" runpod pdf2image && \
-    pip install --no-cache-dir flash-attn --no-build-isolation
-
-# Create models directory and download model during build
-RUN mkdir -p /models/hf && \
-    python -c "import os; from huggingface_hub import snapshot_download; \
-    os.environ['HF_HOME'] = '/models/hf'; \
-    os.environ['TRANSFORMERS_CACHE'] = '/models/hf'; \
-    os.environ['HF_HUB_CACHE'] = '/models/hf'; \
-    snapshot_download(repo_id='reducto/RolmOCR', local_dir='/models/hf/reducto/RolmOCR', local_dir_use_symlinks=False, resume_download=True); \
-    print('Model download complete!')"
-
-# Copy handler
-COPY handler.py .
-
-# Set environment variables for optimal H200 performance
-ENV CUDA_LAUNCH_BLOCKING=0
-ENV CUDA_VISIBLE_DEVICES=0
-ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,expandable_segments:True
-ENV OMP_NUM_THREADS=8
-ENV MKL_NUM_THREADS=8
-
-# Set HuggingFace offline mode for runtime
-ENV HF_HUB_OFFLINE=1
-ENV TRANSFORMERS_OFFLINE=1
+# -------------------------------
+# HF CACHE
+# -------------------------------
 ENV HF_HOME=/models/hf
 ENV TRANSFORMERS_CACHE=/models/hf
 ENV HF_HUB_CACHE=/models/hf
+ENV HF_HUB_ENABLE_HF_TRANSFER=0
+ENV HF_HUB_DISABLE_XET=1
+ENV TOKENIZERS_PARALLELISM=false
 
-# Expose RunPod handler
+# -------------------------------
+# CUDA COMPATIBILITY (ADA + BLACKWELL)
+# -------------------------------
+ENV TORCH_CUDA_ARCH_LIST="8.9;9.0"
+ENV CUDA_VISIBLE_DEVICES=0
+ENV TORCH_CUDNN_V8_API_ENABLED=1
+
+# -------------------------------
+# SYSTEM DEPS
+# -------------------------------
+RUN apt-get update && apt-get install -y \
+    poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    ca-certificates \
+    git \
+    build-essential \
+    libjpeg-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# -------------------------------
+# PYTHON DEPS
+# -------------------------------
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# -------------------------------
+# MODEL DOWNLOAD (BUILD TIME)
+# -------------------------------
+RUN HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python - <<'EOF'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="reducto/RolmOCR",
+    local_dir="/models/hf/reducto/RolmOCR",
+    local_dir_use_symlinks=False
+)
+print("RolmOCR downloaded")
+EOF
+
+# -------------------------------
+# LOCK OFFLINE MODE
+# -------------------------------
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+
+# -------------------------------
+# APP
+# -------------------------------
+COPY handler.py .
 CMD ["python", "-u", "handler.py"]
