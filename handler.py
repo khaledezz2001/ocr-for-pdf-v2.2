@@ -1,6 +1,7 @@
 import os
 import base64
 import io
+import gc
 import torch
 import runpod
 from PIL import Image
@@ -30,7 +31,7 @@ os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '0'
 # ===============================
 MODEL_PATH = "/models/hf/reducto/RolmOCR"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_PAGES = 30
+MAX_PAGES = 20  # Reduced from 30 to prevent throttling on long PDFs
 
 processor = None
 model = None
@@ -57,21 +58,21 @@ def detect_gpu():
             "batch_size": 1,
         }
     # RTX 4090 optimizations (24GB VRAM, Ada Lovelace architecture)
-    # More conservative settings to prevent throttling
+    # Ultra-conservative settings to prevent throttling
     elif "4090" in gpu_name or "40" in gpu_name:
         return "rtx4090", {
-            "target_width": 1400,  # Reduced from 1600 to save memory
-            "dpi": 150,
-            "max_new_tokens": 1280,  # Reduced from 1536 to prevent OOM
+            "target_width": 1200,  # Further reduced
+            "dpi": 120,  # Reduced DPI
+            "max_new_tokens": 1024,  # Further reduced
             "use_flash_attention": False,
             "batch_size": 1,
         }
     # Generic NVIDIA GPU
     else:
         return "generic", {
-            "target_width": 1400,
-            "dpi": 150,
-            "max_new_tokens": 1280,
+            "target_width": 1200,
+            "dpi": 120,
+            "max_new_tokens": 1024,
             "use_flash_attention": False,
             "batch_size": 1,
         }
@@ -342,6 +343,9 @@ def ocr_page(image: Image.Image) -> str:
 # HANDLER
 # ===============================
 def handler(event):
+    import time
+    start_time = time.time()
+    
     load_model()
 
     # Prefix to remove from output
@@ -367,6 +371,9 @@ def handler(event):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             
+            # Force garbage collection
+            gc.collect()
+            
             text = ocr_page(page)
             
             # Remove prefix
@@ -385,10 +392,16 @@ def handler(event):
                 "text": text
             })
             
+            # Delete the page image immediately
+            del page
+            
             # Aggressive cache clearing after each page
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
+            
+            # Force garbage collection again
+            gc.collect()
             
             # Log memory usage
             if torch.cuda.is_available():
@@ -396,10 +409,24 @@ def handler(event):
                 memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
                 log(f"Page {i}/{len(pages)} - VRAM: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
 
+        # Clear pages list
+        del pages
+        gc.collect()
+        
+        # Final cache clear
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Calculate total time
+        total_time = time.time() - start_time
+        log(f"Total processing time: {total_time:.2f}s for {len(extracted_pages)} pages")
+
         return {
             "status": "success",
             "total_pages": len(extracted_pages),
-            "pages": extracted_pages
+            "pages": extracted_pages,
+            "processing_time": round(total_time, 2)
         }
 
     except Exception as e:
