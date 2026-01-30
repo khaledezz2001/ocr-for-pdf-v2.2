@@ -20,7 +20,7 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ===============================
-# MEMORY OPTIMIZATION
+# MEMORY OPTIMIZATION 
 # ===============================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Required for RTX 5090, harmless for 4090
