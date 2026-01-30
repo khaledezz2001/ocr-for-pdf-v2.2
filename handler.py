@@ -22,7 +22,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ===============================
 # MEMORY OPTIMIZATION
 # ===============================
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
+os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '0'
 
 # ===============================
 # CONFIG
@@ -49,27 +50,28 @@ def detect_gpu():
     # but with more tokens and better batching
     if "5090" in gpu_name or "50" in gpu_name:
         return "rtx5090", {
-            "target_width": 1600,  # Keep same as 4090 to avoid vision encoder issues
-            "dpi": 150,  # Keep same as 4090
-            "max_new_tokens": 2048,  # Leverage extra VRAM for longer outputs
-            "use_flash_attention": False,  # Disable to avoid compatibility issues
-            "batch_size": 1,  # Conservative batching
-        }
-    # RTX 4090 optimizations (24GB VRAM, Ada Lovelace architecture)
-    elif "4090" in gpu_name or "40" in gpu_name:
-        return "rtx4090", {
             "target_width": 1600,
             "dpi": 150,
-            "max_new_tokens": 1536,
+            "max_new_tokens": 2048,
+            "use_flash_attention": False,
+            "batch_size": 1,
+        }
+    # RTX 4090 optimizations (24GB VRAM, Ada Lovelace architecture)
+    # More conservative settings to prevent throttling
+    elif "4090" in gpu_name or "40" in gpu_name:
+        return "rtx4090", {
+            "target_width": 1400,  # Reduced from 1600 to save memory
+            "dpi": 150,
+            "max_new_tokens": 1280,  # Reduced from 1536 to prevent OOM
             "use_flash_attention": False,
             "batch_size": 1,
         }
     # Generic NVIDIA GPU
     else:
         return "generic", {
-            "target_width": 1600,
+            "target_width": 1400,
             "dpi": 150,
-            "max_new_tokens": 1536,
+            "max_new_tokens": 1280,
             "use_flash_attention": False,
             "batch_size": 1,
         }
@@ -327,6 +329,12 @@ def ocr_page(image: Image.Image) -> str:
         idx = decoded.lower().index("assistant") + len("assistant")
         decoded = decoded[idx:]
 
+    # Clear intermediate tensors
+    del output_ids
+    del inputs
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return decoded.strip()
 
 
@@ -354,6 +362,11 @@ def handler(event):
         extracted_pages = []
 
         for i, page in enumerate(pages, start=1):
+            # Clear cache before processing each page (RTX 4090 needs this)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             text = ocr_page(page)
             
             # Remove prefix
@@ -372,9 +385,16 @@ def handler(event):
                 "text": text
             })
             
-            # Clear cache after each page to prevent OOM
+            # Aggressive cache clearing after each page
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            # Log memory usage
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                log(f"Page {i}/{len(pages)} - VRAM: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
 
         return {
             "status": "success",
@@ -413,15 +433,20 @@ load_model()
 # Warmup with GPU-appropriate image size
 if torch.cuda.is_available():
     log("Running warmup...")
-    warmup_width = GPU_SETTINGS.get("target_width", 1600)
-    warmup_height = int(warmup_width * 0.75)  # 4:3 aspect ratio
+    # Use smaller warmup image to avoid memory issues
+    warmup_width = 1200  # Smaller for safety
+    warmup_height = 900
     dummy_image = Image.new('RGB', (warmup_width, warmup_height), color='white')
     try:
         _ = ocr_page(dummy_image)
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         log("Warmup complete")
     except Exception as e:
         log(f"Warmup failed: {e}")
+        # Clear cache even if warmup fails
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 runpod.serverless.start({
     "handler": handler
