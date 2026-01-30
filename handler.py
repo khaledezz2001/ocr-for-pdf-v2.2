@@ -20,11 +20,9 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ===============================
-# MEMORY OPTIMIZATION 
+# MEMORY OPTIMIZATION
 # ===============================
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# Required for RTX 5090, harmless for 4090
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 # ===============================
 # CONFIG
@@ -37,30 +35,59 @@ processor = None
 model = None
 
 # ===============================
-# GPU DETECTION (LOW-LEVEL ONLY)
+# GPU DETECTION & OPTIMIZATION
 # ===============================
-def get_gpu_major():
+def detect_gpu():
+    """Detect GPU type and return appropriate settings"""
     if not torch.cuda.is_available():
-        return None
-    major, _ = torch.cuda.get_device_capability()
-    return major
+        return "cpu", {}
+    
+    gpu_name = torch.cuda.get_device_name(0).lower()
+    
+    # RTX 5090 optimizations (32GB VRAM, Ada Lovelace architecture)
+    if "5090" in gpu_name or "50" in gpu_name:
+        return "rtx5090", {
+            "target_width": 2048,  # Higher resolution for more VRAM
+            "dpi": 200,  # Higher DPI for PDF
+            "max_new_tokens": 2048,  # More tokens
+            "use_flash_attention": True,  # RTX 5090 supports Flash Attention 2
+        }
+    # RTX 4090 optimizations (24GB VRAM, Ada Lovelace architecture)
+    elif "4090" in gpu_name or "40" in gpu_name:
+        return "rtx4090", {
+            "target_width": 1600,
+            "dpi": 150,
+            "max_new_tokens": 1536,
+            "use_flash_attention": False,
+        }
+    # Generic NVIDIA GPU
+    else:
+        return "generic", {
+            "target_width": 1600,
+            "dpi": 150,
+            "max_new_tokens": 1536,
+            "use_flash_attention": False,
+        }
 
-GPU_MAJOR = get_gpu_major()
+# Detect GPU and get settings
+GPU_TYPE, GPU_SETTINGS = detect_gpu()
 
 # ===============================
-# RTX OPTIMIZATIONS (SAFE)
+# RTX 4090/5090 OPTIMIZATIONS
 # ===============================
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-
-    # RTX 5090 (Blackwell) stability
-    if GPU_MAJOR and GPU_MAJOR >= 9:
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
-
+    
+    # Enable FP8 for RTX 5090 if available (Blackwell/Ada Lovelace feature)
+    if GPU_TYPE == "rtx5090":
+        try:
+            # RTX 5090 supports FP8 for faster inference
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        except:
+            pass
+    
     torch.cuda.empty_cache()
 
 
@@ -68,15 +95,22 @@ def log(msg):
     print(f"[BOOT] {msg}", flush=True)
 
 
+# Log GPU detection
+log(f"Detected GPU: {GPU_TYPE}")
+log(f"GPU Settings: {GPU_SETTINGS}")
+
+
 # ===============================
 # HALLUCINATION DETECTION
 # ===============================
 def is_hallucinated_output(text: str) -> bool:
+    """Detect if the OCR output is hallucinated/garbage"""
     if not text or len(text.strip()) < 10:
         return True
-
+    
     text_lower = text.lower()
-
+    
+    # Common hallucination phrases that models generate for empty pages
     hallucination_indicators = [
         "table 1:",
         "comparison of different methods",
@@ -92,57 +126,72 @@ def is_hallucinated_output(text: str) -> bool:
         "soil moisture",
         "time domain reflectometry"
     ]
-
+    
+    # Check if text contains hallucination phrases
     for indicator in hallucination_indicators:
         if indicator in text_lower:
             return True
-
+    
+    # Check for repetitive table patterns
     lines = text.strip().split('\n')
     if len(lines) > 20:
         unique_lines = set(line.strip() for line in lines if line.strip())
         if len(unique_lines) < 3:
             return True
-
+    
+    # Check for excessive markdown tables (generic hallucinations)
     table_markers = text.count('|')
     pipe_lines = sum(1 for line in lines if '|' in line)
-
+    
+    # If more than 50% of lines have pipes, likely a hallucinated table
     if len(lines) > 0 and pipe_lines / len(lines) > 0.5:
+        # Check if it's a real table with actual content or generic hallucination
         content_without_pipes = text.replace('|', '').replace('-', '').replace('\n', '').strip()
-        if len(content_without_pipes) < 100:
+        if len(content_without_pipes) < 100:  # Too little actual content
             return True
-
+    
+    # Check for suspiciously perfect table formatting (hallucination signature)
     if table_markers > 10:
+        # Real tables usually have irregular content
+        # Hallucinated tables often have very uniform structure
         table_rows = [line for line in lines if '|' in line]
         if len(table_rows) > 3:
+            # Count pipes per row
             pipe_counts = [line.count('|') for line in table_rows]
+            # If all rows have exactly the same number of pipes, suspicious
             if len(set(pipe_counts)) == 1 and pipe_counts[0] > 3:
                 return True
-
+    
+    # Check for only special characters
     alphanumeric_chars = sum(c.isalnum() for c in text)
     if alphanumeric_chars < 10:
         return True
-
+    
     return False
 
 
 # ===============================
-# IMAGE DECODING
+# IMAGE DECODING (GPU-ADAPTIVE)
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-    target_width = 1600
+
+    # Use GPU-specific resolution
+    target_width = GPU_SETTINGS.get("target_width", 1600)
     scale = target_width / img.width
-    return img.resize(
+    img = img.resize(
         (target_width, int(img.height * scale)),
         Image.BICUBIC
     )
+    return img
 
 
 def decode_pdf(b64):
     pdf_bytes = base64.b64decode(b64)
+    dpi = GPU_SETTINGS.get("dpi", 150)
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=150,
+        dpi=dpi,
         fmt="png",
         thread_count=4,
         use_pdftocairo=True
@@ -164,27 +213,31 @@ def load_model():
         local_files_only=True
     )
 
-    # ONLY hardware-adaptive change
-    dtype = torch.bfloat16 if GPU_MAJOR and GPU_MAJOR >= 9 else torch.float16
-
     log("Loading model...")
+    
+    # Prepare model loading kwargs
+    model_kwargs = {
+        "device_map": "auto",
+        "torch_dtype": torch.float16,
+        "local_files_only": True,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # Add Flash Attention 2 for RTX 5090 if supported
+    if GPU_SETTINGS.get("use_flash_attention", False):
+        try:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            log("Enabling Flash Attention 2 for RTX 5090")
+        except:
+            log("Flash Attention 2 not available, using default")
+    
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_PATH,
-        device_map="auto",
-        torch_dtype=dtype,
-        local_files_only=True,
-        low_cpu_mem_usage=True
+        **model_kwargs
     )
 
-    # RTX 5090: force stable attention (MODEL LEVEL, not generate)
-    if GPU_MAJOR and GPU_MAJOR >= 9:
-        try:
-            model.config.attn_implementation = "eager"
-        except Exception:
-            pass
-
     model.eval()
-    log("RolmOCR model loaded")
+    log(f"RolmOCR model loaded on {GPU_TYPE}")
 
 
 # ===============================
@@ -233,12 +286,15 @@ def ocr_page(image: Image.Image) -> str:
         padding=True
     ).to(DEVICE, non_blocking=True)
 
+    # Get max tokens based on GPU
+    max_new_tokens = GPU_SETTINGS.get("max_new_tokens", 1536)
+    
     with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=1536,
+            max_new_tokens=max_new_tokens,
             min_new_tokens=10,
-            temperature=0.0,
+            temperature=0.0,          # No hallucination
             do_sample=False,
             num_beams=1,
             repetition_penalty=1.1,
@@ -253,6 +309,7 @@ def ocr_page(image: Image.Image) -> str:
         clean_up_tokenization_spaces=False
     )[0]
 
+    # Clean up response
     if "assistant" in decoded.lower():
         idx = decoded.lower().index("assistant") + len("assistant")
         decoded = decoded[idx:]
@@ -266,7 +323,9 @@ def ocr_page(image: Image.Image) -> str:
 def handler(event):
     load_model()
 
+    # Prefix to remove from output
     PREFIX =".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n\nCRITICAL RULES:\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\n- Do NOT make up content if the page is blank or empty\n- If the page is truly empty, output only: EMPTY_PAGE\n- Do NOT create tables, examples, or sample data\n\nReturn ONLY the extracted text, nothing else.\nassistant\n"
+    
 
     try:
         if "image" in event["input"]:
@@ -274,19 +333,33 @@ def handler(event):
         elif "file" in event["input"]:
             pages = decode_pdf(event["input"]["file"])
         else:
-            return {"status": "error", "message": "Missing image or file"}
+            return {
+                "status": "error",
+                "message": "Missing image or file"
+            }
 
         extracted_pages = []
 
         for i, page in enumerate(pages, start=1):
             text = ocr_page(page)
+            
+            # Remove prefix
             text = text.replace(PREFIX, "", 1).strip()
-
-            if text.upper().startswith("EMPTY_PAGE") or is_hallucinated_output(text):
+            
+            # Check if model explicitly said it's empty
+            if text.upper() == "EMPTY_PAGE" or text.upper().startswith("EMPTY_PAGE"):
                 text = "[Empty or unreadable page]"
-
-            extracted_pages.append({"page": i, "text": text})
-
+            # Detect hallucinations
+            elif is_hallucinated_output(text):
+                log(f"Warning: Page {i} appears to be hallucinated")
+                text = "[Empty or unreadable page]"
+            
+            extracted_pages.append({
+                "page": i,
+                "text": text
+            })
+            
+            # Clear cache after each page to prevent OOM
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -297,10 +370,13 @@ def handler(event):
         }
 
     except Exception as e:
-        log(f"Error: {e}")
+        log(f"Error: {str(e)}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return {"status": "error", "message": str(e)}
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 
 # ===============================
@@ -309,9 +385,12 @@ def handler(event):
 log("Preloading model...")
 load_model()
 
+# Warmup with GPU-appropriate image size
 if torch.cuda.is_available():
     log("Running warmup...")
-    dummy_image = Image.new("RGB", (1600, 1200), "white")
+    warmup_width = GPU_SETTINGS.get("target_width", 1600)
+    warmup_height = int(warmup_width * 0.75)  # 4:3 aspect ratio
+    dummy_image = Image.new('RGB', (warmup_width, warmup_height), color='white')
     try:
         _ = ocr_page(dummy_image)
         torch.cuda.empty_cache()
@@ -319,4 +398,6 @@ if torch.cuda.is_available():
     except Exception as e:
         log(f"Warmup failed: {e}")
 
-runpod.serverless.start({"handler": handler})
+runpod.serverless.start({
+    "handler": handler
+})
