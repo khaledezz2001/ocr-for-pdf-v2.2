@@ -45,12 +45,15 @@ def detect_gpu():
     gpu_name = torch.cuda.get_device_name(0).lower()
     
     # RTX 5090 optimizations (32GB VRAM, Ada Lovelace architecture)
+    # Using same resolution as 4090 to avoid CUDA assertion errors
+    # but with more tokens and better batching
     if "5090" in gpu_name or "50" in gpu_name:
         return "rtx5090", {
-            "target_width": 2048,  # Higher resolution for more VRAM
-            "dpi": 200,  # Higher DPI for PDF
-            "max_new_tokens": 2048,  # More tokens
-            "use_flash_attention": True,  # RTX 5090 supports Flash Attention 2
+            "target_width": 1600,  # Keep same as 4090 to avoid vision encoder issues
+            "dpi": 150,  # Keep same as 4090
+            "max_new_tokens": 2048,  # Leverage extra VRAM for longer outputs
+            "use_flash_attention": False,  # Disable to avoid compatibility issues
+            "batch_size": 1,  # Conservative batching
         }
     # RTX 4090 optimizations (24GB VRAM, Ada Lovelace architecture)
     elif "4090" in gpu_name or "40" in gpu_name:
@@ -59,6 +62,7 @@ def detect_gpu():
             "dpi": 150,
             "max_new_tokens": 1536,
             "use_flash_attention": False,
+            "batch_size": 1,
         }
     # Generic NVIDIA GPU
     else:
@@ -67,6 +71,7 @@ def detect_gpu():
             "dpi": 150,
             "max_new_tokens": 1536,
             "use_flash_attention": False,
+            "batch_size": 1,
         }
 
 # Detect GPU and get settings
@@ -79,15 +84,6 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-    
-    # Enable FP8 for RTX 5090 if available (Blackwell/Ada Lovelace feature)
-    if GPU_TYPE == "rtx5090":
-        try:
-            # RTX 5090 supports FP8 for faster inference
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-        except:
-            pass
-    
     torch.cuda.empty_cache()
 
 
@@ -215,25 +211,14 @@ def load_model():
 
     log("Loading model...")
     
-    # Prepare model loading kwargs
-    model_kwargs = {
-        "device_map": "auto",
-        "torch_dtype": torch.float16,
-        "local_files_only": True,
-        "low_cpu_mem_usage": True,
-    }
-    
-    # Add Flash Attention 2 for RTX 5090 if supported
-    if GPU_SETTINGS.get("use_flash_attention", False):
-        try:
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            log("Enabling Flash Attention 2 for RTX 5090")
-        except:
-            log("Flash Attention 2 not available, using default")
-    
+    # Model loading - same settings for both RTX 4090 and 5090
+    # to ensure compatibility with vision encoder
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_PATH,
-        **model_kwargs
+        device_map="auto",
+        torch_dtype=torch.float16,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
     )
 
     model.eval()
@@ -289,19 +274,47 @@ def ocr_page(image: Image.Image) -> str:
     # Get max tokens based on GPU
     max_new_tokens = GPU_SETTINGS.get("max_new_tokens", 1536)
     
+    # Synchronize CUDA to prevent device-side assert issues
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
     with torch.inference_mode():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=10,
-            temperature=0.0,          # No hallucination
-            do_sample=False,
-            num_beams=1,
-            repetition_penalty=1.1,
-            use_cache=True,
-            pad_token_id=processor.tokenizer.pad_token_id,
-            eos_token_id=processor.tokenizer.eos_token_id
-        )
+        try:
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=10,
+                temperature=0.0,          # No hallucination
+                do_sample=False,
+                num_beams=1,
+                repetition_penalty=1.1,
+                use_cache=True,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id
+            )
+        except RuntimeError as e:
+            if "device-side assert" in str(e) or "CUDA error" in str(e):
+                # Clear CUDA cache and retry with safer settings
+                log(f"CUDA error detected, retrying with safer settings: {str(e)}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Retry with even smaller max tokens
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=1024,  # Reduced for safety
+                    min_new_tokens=10,
+                    temperature=0.0,
+                    do_sample=False,
+                    num_beams=1,
+                    repetition_penalty=1.1,
+                    use_cache=True,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                    eos_token_id=processor.tokenizer.eos_token_id
+                )
+            else:
+                raise
 
     decoded = processor.batch_decode(
         output_ids,
@@ -371,11 +384,23 @@ def handler(event):
 
     except Exception as e:
         log(f"Error: {str(e)}")
+        
+        # Better CUDA error handling
         if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except:
+                pass
             torch.cuda.empty_cache()
+        
+        # Return more informative error
+        error_msg = str(e)
+        if "device-side assert" in error_msg or "CUDA error" in error_msg:
+            error_msg = "CUDA processing error. Try with a smaller image or different settings."
+        
         return {
             "status": "error",
-            "message": str(e)
+            "message": error_msg
         }
 
 
