@@ -9,4 +9,3 @@ huggingface_hub
 protobuf
 numpy<2.0
 pdf2image
-flash-attn>=2.5.0  # For RTX 5090 Flash Attention 2 support (optional, will skip if build fails)
