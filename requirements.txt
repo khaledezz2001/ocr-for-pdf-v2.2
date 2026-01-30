@@ -1,11 +1,12 @@
 runpod
-torch==2.8.0
-torchvision
+torch==2.4.0
+torchvision==0.19.0
 transformers>=4.40.0
 accelerate
-pillow
+pillow  # Using regular pillow to avoid build issues
 opencv-python-headless
 huggingface_hub
 protobuf
 numpy<2.0
 pdf2image
+flash-attn>=2.5.0  # For RTX 5090 Flash Attention 2 support (optional, will skip if build fails)
