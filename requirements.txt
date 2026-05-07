@@ -1,11 +1,16 @@
+# RunPod serverless
 runpod
-torch==2.4.0
-torchvision==0.19.0
-transformers>=4.40.0
-accelerate
-pillow  # Using regular pillow to avoid build issues
-opencv-python-headless
+
+# Image / PDF processing
+pillow
+pdf2image
+numpy<2.0
+
+# Chandra OCR package — provides prompts, output parser (parse_markdown)
+# No [hf] extra needed — vLLM handles inference, transformers only for processor
+chandra-ocr
+transformers
+
+# HF hub for model download at build time
 huggingface_hub
 protobuf
-numpy<2.0
-pdf2image
