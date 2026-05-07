@@ -2,12 +2,23 @@ import os
 import base64
 import io
 import time
+
+import torch
 import runpod
 from PIL import Image
+import PIL
+from transformers import AutoProcessor, AutoModelForImageTextToText
 from pdf2image import convert_from_bytes
 
+# ---- Disable decompression bomb guard AFTER all imports ----
+# Some libraries (transformers, etc.) reset MAX_IMAGE_PIXELS during import,
+# so we must set this after every import that touches PIL.
+PIL.Image.MAX_IMAGE_PIXELS = None
+if hasattr(PIL.Image, '_decompression_bomb_check'):
+    PIL.Image._decompression_bomb_check = lambda pixels: None  # failsafe patch
+
 # ===============================
-# OFFLINE MODE
+# OFFLINE MODE (RUNTIME)
 # ===============================
 os.environ["HF_HOME"] = "/models/hf"
 os.environ["HF_HUB_CACHE"] = "/models/hf"
@@ -16,200 +27,258 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["VLLM_FLASH_ATTN_VERSION"] = "2"
 
 # ===============================
 # CONFIG
 # ===============================
-MODEL_PATH      = "/models/hf/datalab-to/chandra-ocr-2"
-MAX_PAGES       = 100
-MAX_NEW_TOKENS  = 32768   # was 12384 — increased to prevent truncation on dense pages
-MAX_NUM_SEQS    = 4       # reduced from 8 to free up memory for larger context
+MODEL_PATH = "/models/hf/allenai/olmOCR-2-7B-1025-FP8"
+MAX_PAGES = 100
+MAX_NEW_TOKENS = 1536
+BATCH_SIZE = 8   # pages per forward pass — tune down if OOM, up for speed
 
-# ---------------------------------------------------------------
-# IMAGE QUALITY SETTINGS
-# ---------------------------------------------------------------
-PDF_DPI         = 300
-TARGET_WIDTH    = 2400
-
-llm = None
+model = None
+processor = None
 
 def log(msg):
-    print(f"[HANDLER] {msg}", flush=True)
+    print(f"[BOOT] {msg}", flush=True)
 
 # ===============================
-# IMAGE HELPERS
+# HALLUCINATION DETECTION
 # ===============================
-def decode_image(b64: str) -> Image.Image:
+def is_hallucinated_output(text: str) -> bool:
+    if not text or len(text.strip()) < 10:
+        return True
+
+    text_lower = text.lower()
+
+    hallucination_indicators = [
+        "table 1:", "comparison of different methods", "note: the choice of method",
+        "this page is blank", "no text found", "empty page", "the image appears to be",
+        "there is no visible text", "the document appears to be blank", "i cannot see any text",
+        "method | accuracy | speed", "soil moisture", "time domain reflectometry"
+    ]
+    for indicator in hallucination_indicators:
+        if indicator in text_lower:
+            return True
+
+    lines = text.strip().split('\n')
+    if len(lines) > 20:
+        unique_lines = set(line.strip() for line in lines if line.strip())
+        if len(unique_lines) < 3:
+            return True
+
+    pipe_lines = sum(1 for line in lines if '|' in line)
+    if len(lines) > 0 and pipe_lines / len(lines) > 0.5:
+        content_without_pipes = text.replace('|', '').replace('-', '').replace('\n', '').strip()
+        if len(content_without_pipes) < 100:
+            return True
+
+    table_markers = text.count('|')
+    if table_markers > 10:
+        table_rows = [line for line in lines if '|' in line]
+        if len(table_rows) > 3:
+            pipe_counts = [line.count('|') for line in table_rows]
+            if len(set(pipe_counts)) == 1 and pipe_counts[0] > 3:
+                return True
+
+    if sum(c.isalnum() for c in text) < 10:
+        return True
+
+    return False
+
+# ===============================
+# IMAGE DECODING
+# ===============================
+def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-    scale = TARGET_WIDTH / img.width
-    return img.resize((TARGET_WIDTH, int(img.height * scale)), Image.BICUBIC)
+    target_width = 1600
+    scale = target_width / img.width
+    img = img.resize((target_width, int(img.height * scale)), Image.BICUBIC)
+    return img
 
-def decode_pdf(b64: str) -> list:
+def decode_pdf(b64):
+    # Re-apply guard removal right before use (belt-and-suspenders)
+    PIL.Image.MAX_IMAGE_PIXELS = None
+
     pdf_bytes = base64.b64decode(b64)
     images = convert_from_bytes(
-        pdf_bytes,
-        dpi=PDF_DPI,
-        fmt="png",
-        thread_count=4,
-        use_pdftocairo=True,
+        pdf_bytes, dpi=200, fmt="png", thread_count=4, use_pdftocairo=True,
+        size=(1600, None),  # cap width at 1600px
     )
+    # Resize oversized pages to keep memory under control
     resized = []
     for img in images[:MAX_PAGES]:
-        scale = TARGET_WIDTH / img.width
-        resized.append(
-            img.resize((TARGET_WIDTH, int(img.height * scale)), Image.BICUBIC)
-        )
+        img = img.convert("RGB")
+        if img.width > 1600:
+            scale = 1600 / img.width
+            img = img.resize((1600, int(img.height * scale)), Image.BICUBIC)
+        resized.append(img)
     return resized
 
 # ===============================
-# LOAD vLLM IN-PROCESS (once)
+# LOAD MODEL ONCE
 # ===============================
 def load_model():
-    global llm
-    if llm is not None:
+    global model, processor
+    if model is not None:
         return
 
-    from vllm import LLM
+    log("Loading processor...")
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True)
 
-    log("Loading Chandra 2 via vLLM (in-process)...")
-    llm = LLM(
-        model=MODEL_PATH,
-        dtype="bfloat16",
-        max_model_len=32768,          # was 8192 — must match MAX_NEW_TOKENS
-        max_num_seqs=MAX_NUM_SEQS,
-        gpu_memory_utilization=0.92,  # slightly higher to accommodate larger context
+    log("Loading model onto GPU...")
+    # Load as bfloat16 — the FP8 checkpoint is dequantized on load.
+    # FP8 inference kernels are not available on Blackwell (sm_120) yet,
+    # so running in FP8 falls back to slow scalar ops (~90s/page).
+    # bfloat16 uses native tensor cores and is ~10x faster here.
+    model = AutoModelForImageTextToText.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
         trust_remote_code=True,
-        limit_mm_per_prompt={"image": 1},
-        enforce_eager=False,
+        local_files_only=True,
+        ignore_mismatched_sizes=True,
+        attn_implementation="sdpa",  # scaled dot-product attention — faster than eager
     )
-    log("Chandra 2 vLLM engine ready")
+    model.eval()
+
+    log("Compiling model with torch.compile...")
+    # torch.compile fuses ops and enables CUDA graphs — big win on Blackwell.
+    # "reduce-overhead" is the best mode for repeated same-shape inference.
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    log("Model loaded and compiled successfully")
 
 # ===============================
-# BUILD CHANDRA PROMPT
+# OCR PROMPT
 # ===============================
-def build_prompt(img: Image.Image) -> dict:
-    from chandra.prompts import PROMPT_MAPPING
-    from transformers import AutoProcessor
+OCR_PROMPT_TEXT = (
+    "Attached is one page of a document that you must process. "
+    "Just return the plain text representation of this document as if you were reading it naturally. "
+    "Convert equations to LateX and tables to HTML."
+)
 
-    if not hasattr(build_prompt, "_processor"):
-        build_prompt._processor = AutoProcessor.from_pretrained(
-            MODEL_PATH, local_files_only=True
-        )
-
-    processor = build_prompt._processor
-    ocr_prompt = PROMPT_MAPPING["ocr_layout"]
-
-    messages = [
+def build_messages(image: Image.Image) -> list:
+    return [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": img},
-                {"type": "text",  "text": ocr_prompt},
-            ],
+                {"type": "image", "image": image},
+                {"type": "text",  "text": OCR_PROMPT_TEXT}
+            ]
         }
     ]
 
-    prompt_text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    return {
-        "prompt": prompt_text,
-        "multi_modal_data": {"image": img},
-    }
-
 # ===============================
-# BATCH OCR via vLLM offline API
+# BATCH OCR (transformers)
 # ===============================
 def ocr_batch(images: list) -> list:
-    from vllm import SamplingParams
-    from chandra.output import parse_markdown
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NEW_TOKENS,
-        temperature=0.0,
-        top_p=0.1,
-        repetition_penalty=1.05,
-    )
-
-    inputs = [build_prompt(img) for img in images]
-    outputs = llm.generate(inputs, sampling_params=sampling_params)
-
     results = []
-    for out in outputs:
-        raw = out.outputs[0].text.strip()
 
-        # Check if output was truncated (didn't finish naturally)
-        finish_reason = out.outputs[0].finish_reason
-        if finish_reason == "length":
-            log(f"WARNING: Output truncated — consider increasing MAX_NEW_TOKENS further")
+    for i in range(0, len(images), BATCH_SIZE):
+        chunk = images[i:i + BATCH_SIZE]
 
-        try:
-            text = parse_markdown(raw)
-        except Exception:
-            text = raw
-        results.append(text)
+        # Build per-image chat messages and apply the chat template
+        texts = []
+        all_images = []
+        for img in chunk:
+            messages = build_messages(img)
+            text = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            texts.append(text)
+            all_images.append(img)
+
+        inputs = processor(
+            text=texts,
+            images=all_images,
+            return_tensors="pt",
+            padding=True,
+        ).to("cuda")
+
+        with torch.inference_mode():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                repetition_penalty=1.1,
+                use_cache=True,
+            )
+
+        # Decode only the newly generated tokens (strip the prompt)
+        input_len = inputs["input_ids"].shape[1]
+        for gen_ids in generated_ids:
+            new_tokens = gen_ids[input_len:]
+            decoded = processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            results.append(decoded.strip())
+
+        del inputs, generated_ids
+        torch.cuda.empty_cache()
 
     return results
 
 # ===============================
-# RUNPOD HANDLER
+# HANDLER
 # ===============================
 def handler(event):
     load_model()
+
     try:
-        inp = event.get("input", {})
-        if "image" in inp:
-            pages = [decode_image(inp["image"])]
-        elif "file" in inp:
-            pages = decode_pdf(inp["file"])
+        if "image" in event["input"]:
+            pages = [decode_image(event["input"]["image"])]
+        elif "file" in event["input"]:
+            pages = decode_pdf(event["input"]["file"])
         else:
-            return {"status": "error", "message": "Missing 'image' or 'file' in input"}
+            return {"status": "error", "message": "Missing image or file"}
 
         total_pages = len(pages)
-        log(f"Processing {total_pages} page(s) at {PDF_DPI} DPI / {TARGET_WIDTH}px width...")
-        t0 = time.time()
+        log(f"Processing {total_pages} pages using transformers...")
+        start_time = time.time()
 
-        raw_results = ocr_batch(pages)
+        batch_results = ocr_batch(pages)
 
         extracted_pages = []
-        for j, text in enumerate(raw_results):
+        for j, text in enumerate(batch_results):
             page_num = j + 1
-            if not text or len(text.strip()) < 5:
+
+            if text.upper().startswith("EMPTY_PAGE"):
                 text = "[Empty or unreadable page]"
+            elif is_hallucinated_output(text):
+                log(f"Warning: Page {page_num} appears to be hallucinated")
+                text = "[Empty or unreadable page]"
+
             extracted_pages.append({"page": page_num, "text": text})
 
-        elapsed = time.time() - t0
-        log(f"Done: {total_pages} pages in {elapsed:.1f}s ({elapsed/total_pages:.1f}s/page)")
+        torch.cuda.empty_cache()
+
+        elapsed = time.time() - start_time
+        log(f"Completed {total_pages} pages in {elapsed:.1f}s ({elapsed/total_pages:.1f}s/page)")
 
         return {
             "status": "success",
             "total_pages": len(extracted_pages),
-            "pages": extracted_pages,
+            "pages": extracted_pages
         }
 
     except Exception as e:
-        import traceback
-        log(f"Error: {e}\n{traceback.format_exc()}")
+        log(f"Error: {str(e)}")
+        torch.cuda.empty_cache()
         return {"status": "error", "message": str(e)}
 
 # ===============================
-# ENTRY POINT
-# *** __main__ guard prevents vLLM spawn workers from re-running this ***
+# PRELOAD & WARMUP
 # ===============================
-if __name__ == "__main__":
-    log("Cold start — loading Chandra 2 via vLLM...")
-    load_model()
+log("Preloading model...")
+load_model()
 
-    log("Running warmup pass...")
+if torch.cuda.is_available():
+    log("Running dummy warmup...")
+    dummy_image = Image.new('RGB', (1600, 1200), color='white')
     try:
-        dummy = Image.new("RGB", (TARGET_WIDTH, 1800), color="white")
-        _ = ocr_batch([dummy])
+        _ = ocr_batch([dummy_image])
         log("Warmup complete!")
     except Exception as e:
-        log(f"Warmup error (non-fatal): {e}")
+        log(f"Warmup error: {e}")
 
-    runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler})
