@@ -25,7 +25,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ===============================
 # CONFIG
 # ===============================
-MODEL_PATH = "/models/hf/allenai/olmOCR-2-7B-1025-FP8"
+MODEL_PATH = "/models/hf/datalab-to/chandra-ocr-2"
 MAX_PAGES = 100
 MAX_NEW_TOKENS = 1536
 BATCH_SIZE = 8   # pages per forward pass — tune down if OOM, up for speed
