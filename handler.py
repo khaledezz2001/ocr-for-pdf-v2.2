@@ -2,25 +2,15 @@ import os
 import base64
 import io
 import time
+import subprocess
+import threading
+import requests
 
-import torch
 import runpod
 from PIL import Image
 import PIL
 PIL.Image.MAX_IMAGE_PIXELS = None  # disable decompression bomb guard for large PDFs
-from transformers import AutoProcessor, AutoModelForImageTextToText
 from pdf2image import convert_from_bytes
-
-# ===============================
-# OFFLINE MODE (RUNTIME)
-# ===============================
-os.environ["HF_HOME"] = "/models/hf"
-os.environ["HF_HUB_CACHE"] = "/models/hf"
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ===============================
 # CONFIG
@@ -28,10 +18,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 MODEL_PATH = "/models/hf/datalab-to/chandra-ocr-2"
 MAX_PAGES = 100
 MAX_NEW_TOKENS = 1536
-BATCH_SIZE = 8   # pages per forward pass — tune down if OOM, up for speed
+VLLM_PORT = 8000
+VLLM_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
+VLLM_HEALTH_URL = f"http://localhost:{VLLM_PORT}/health"
 
-model = None
-processor = None
+vllm_process = None
 
 def log(msg):
     print(f"[BOOT] {msg}", flush=True)
@@ -106,41 +97,77 @@ def decode_pdf(b64):
         resized.append(img)
     return resized
 
-# ===============================
-# LOAD MODEL ONCE
-# ===============================
-def load_model():
-    global model, processor
-    if model is not None:
-        return
+def image_to_base64_url(img: Image.Image) -> str:
+    """Convert a PIL image to a base64 data URL for the vLLM API."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
-    log("Loading processor...")
-    processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True)
+# ===============================
+# vLLM SERVER MANAGEMENT
+# ===============================
+def stream_output(pipe, label):
+    """Stream subprocess output to stdout."""
+    for line in iter(pipe.readline, ''):
+        print(f"[vLLM {label}] {line}", end='', flush=True)
 
-    log("Loading model onto GPU...")
-    # Load as bfloat16 — the FP8 checkpoint is dequantized on load.
-    # FP8 inference kernels are not available on Blackwell (sm_120) yet,
-    # so running in FP8 falls back to slow scalar ops (~90s/page).
-    # bfloat16 uses native tensor cores and is ~10x faster here.
-    model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
-        trust_remote_code=True,
-        local_files_only=True,
-        ignore_mismatched_sizes=True,
-        attn_implementation="sdpa",  # scaled dot-product attention — faster than eager
+def start_vllm_server():
+    """Start the vLLM server as a background process."""
+    global vllm_process
+
+    log("Starting vLLM server...")
+    cmd = [
+        "python3", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", MODEL_PATH,
+        "--port", str(VLLM_PORT),
+        "--trust-remote-code",
+        "--dtype", "bfloat16",
+        "--max-model-len", "4096",
+        "--max-num-seqs", "8",
+        "--gpu-memory-utilization", "0.90",
+    ]
+
+    env = os.environ.copy()
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+
+    vllm_process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
     )
-    model.eval()
 
-    log("Compiling model with torch.compile...")
-    # torch.compile fuses ops and enables CUDA graphs — big win on Blackwell.
-    # "reduce-overhead" is the best mode for repeated same-shape inference.
-    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-    log("Model loaded and compiled successfully")
+    # Stream vLLM output in a background thread
+    t = threading.Thread(target=stream_output, args=(vllm_process.stdout, "OUT"), daemon=True)
+    t.start()
+
+    # Wait for the server to be ready
+    max_wait = 300  # 5 minutes
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            r = requests.get(VLLM_HEALTH_URL, timeout=2)
+            if r.status_code == 200:
+                log(f"vLLM server ready in {time.time() - start:.1f}s")
+                return True
+        except requests.ConnectionError:
+            pass
+
+        # Check if process died
+        if vllm_process.poll() is not None:
+            log(f"vLLM server exited with code {vllm_process.returncode}")
+            return False
+
+        time.sleep(2)
+
+    log("vLLM server timed out!")
+    return False
 
 # ===============================
-# OCR PROMPT
+# OCR VIA vLLM
 # ===============================
 OCR_PROMPT_TEXT = (
     "Attached is one page of a document that you must process. "
@@ -148,73 +175,49 @@ OCR_PROMPT_TEXT = (
     "Convert equations to LateX and tables to HTML."
 )
 
-def build_messages(image: Image.Image) -> list:
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text",  "text": OCR_PROMPT_TEXT}
-            ]
-        }
-    ]
+def ocr_page(image: Image.Image) -> str:
+    """Send a single page to the vLLM server for OCR."""
+    img_url = image_to_base64_url(image)
 
-# ===============================
-# BATCH OCR (transformers)
-# ===============================
+    payload = {
+        "model": MODEL_PATH,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": img_url}
+                    },
+                    {
+                        "type": "text",
+                        "text": OCR_PROMPT_TEXT
+                    }
+                ]
+            }
+        ],
+        "max_tokens": MAX_NEW_TOKENS,
+        "temperature": 0.0,
+        "repetition_penalty": 1.1,
+    }
+
+    resp = requests.post(VLLM_URL, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
 def ocr_batch(images: list) -> list:
+    """Process multiple pages sequentially via the vLLM server."""
     results = []
-
-    for i in range(0, len(images), BATCH_SIZE):
-        chunk = images[i:i + BATCH_SIZE]
-
-        # Build per-image chat messages and apply the chat template
-        texts = []
-        all_images = []
-        for img in chunk:
-            messages = build_messages(img)
-            text = processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            texts.append(text)
-            all_images.append(img)
-
-        inputs = processor(
-            text=texts,
-            images=all_images,
-            return_tensors="pt",
-            padding=True,
-        ).to("cuda")
-
-        with torch.inference_mode():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                repetition_penalty=1.1,
-                use_cache=True,
-            )
-
-        # Decode only the newly generated tokens (strip the prompt)
-        input_len = inputs["input_ids"].shape[1]
-        for gen_ids in generated_ids:
-            new_tokens = gen_ids[input_len:]
-            decoded = processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            results.append(decoded.strip())
-
-        del inputs, generated_ids
-        torch.cuda.empty_cache()
-
+    for img in images:
+        text = ocr_page(img)
+        results.append(text)
     return results
 
 # ===============================
 # HANDLER
 # ===============================
 def handler(event):
-    load_model()
-
     try:
         if "image" in event["input"]:
             pages = [decode_image(event["input"]["image"])]
@@ -224,7 +227,7 @@ def handler(event):
             return {"status": "error", "message": "Missing image or file"}
 
         total_pages = len(pages)
-        log(f"Processing {total_pages} pages using transformers...")
+        log(f"Processing {total_pages} pages via vLLM...")
         start_time = time.time()
 
         batch_results = ocr_batch(pages)
@@ -241,8 +244,6 @@ def handler(event):
 
             extracted_pages.append({"page": page_num, "text": text})
 
-        torch.cuda.empty_cache()
-
         elapsed = time.time() - start_time
         log(f"Completed {total_pages} pages in {elapsed:.1f}s ({elapsed/total_pages:.1f}s/page)")
 
@@ -254,22 +255,22 @@ def handler(event):
 
     except Exception as e:
         log(f"Error: {str(e)}")
-        torch.cuda.empty_cache()
         return {"status": "error", "message": str(e)}
 
 # ===============================
-# PRELOAD & WARMUP
+# PRELOAD: START vLLM SERVER
 # ===============================
-log("Preloading model...")
-load_model()
+log("Booting vLLM server...")
+if not start_vllm_server():
+    log("FATAL: vLLM server failed to start!")
+    raise RuntimeError("vLLM server failed to start")
 
-if torch.cuda.is_available():
-    log("Running dummy warmup...")
+log("Running dummy warmup...")
+try:
     dummy_image = Image.new('RGB', (1600, 1200), color='white')
-    try:
-        _ = ocr_batch([dummy_image])
-        log("Warmup complete!")
-    except Exception as e:
-        log(f"Warmup error: {e}")
+    _ = ocr_page(dummy_image)
+    log("Warmup complete!")
+except Exception as e:
+    log(f"Warmup error (non-fatal): {e}")
 
 runpod.serverless.start({"handler": handler})
