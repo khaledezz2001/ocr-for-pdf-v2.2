@@ -6,10 +6,8 @@ pillow
 pdf2image
 numpy<2.0
 
-# Chandra OCR package — provides prompts, output parser (parse_markdown)
-# No [hf] extra needed — vLLM handles inference, transformers only for processor
-chandra-ocr
-transformers
+# HTTP client for vLLM API
+requests
 
 # HF hub for model download at build time
 huggingface_hub
