@@ -7,15 +7,9 @@ import torch
 import runpod
 from PIL import Image
 import PIL
+PIL.Image.MAX_IMAGE_PIXELS = None  # disable decompression bomb guard for large PDFs
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from pdf2image import convert_from_bytes
-
-# ---- Disable decompression bomb guard AFTER all imports ----
-# Some libraries (transformers, etc.) reset MAX_IMAGE_PIXELS during import,
-# so we must set this after every import that touches PIL.
-PIL.Image.MAX_IMAGE_PIXELS = None
-if hasattr(PIL.Image, '_decompression_bomb_check'):
-    PIL.Image._decompression_bomb_check = lambda pixels: None  # failsafe patch
 
 # ===============================
 # OFFLINE MODE (RUNTIME)
@@ -97,13 +91,10 @@ def decode_image(b64):
     return img
 
 def decode_pdf(b64):
-    # Re-apply guard removal right before use (belt-and-suspenders)
-    PIL.Image.MAX_IMAGE_PIXELS = None
-
     pdf_bytes = base64.b64decode(b64)
     images = convert_from_bytes(
-        pdf_bytes, dpi=200, fmt="png", thread_count=4, use_pdftocairo=True,
-        size=(1600, None),  # cap width at 1600px
+        pdf_bytes, dpi=150, fmt="png", thread_count=4, use_pdftocairo=True,
+        size=(1400, None),  # cap width to keep pixel count under bomb limit
     )
     # Resize oversized pages to keep memory under control
     resized = []
