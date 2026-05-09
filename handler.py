@@ -171,8 +171,18 @@ def start_vllm_server():
 # ===============================
 OCR_PROMPT_TEXT = (
     "Attached is one page of a document that you must process. "
-    "Just return the plain text representation of this document as if you were reading it naturally. "
-    "Convert equations to LateX and tables to HTML."
+    "Return the content using **Markdown** formatting with these strict rules:\n\n"
+    "1. Use `#` for main titles, `##` for subtitles, `###` for section headers.\n"
+    "2. Regular text paragraphs should be plain text separated by blank lines.\n"
+    "3. Lists should use Markdown bullet syntax: `- item`.\n"
+    "4. Tables must use simple HTML `<table>` tags — NO `border` attribute, "
+    "NO `<div>` wrappers, NO `data-bbox` or `data-label` attributes. "
+    "Use `<b>` for bold text inside table cells. Use `<br/>` for line breaks within cells.\n"
+    "5. Convert equations to LaTeX.\n"
+    "6. Do NOT wrap any content in `<div>` tags.\n"
+    "7. Do NOT include bounding box coordinates or layout labels.\n"
+    "8. Separate each section with a blank line (`\\n\\n`).\n\n"
+    "Output only the document content in Markdown. Do not add any commentary."
 )
 
 def ocr_page(image: Image.Image) -> str:
