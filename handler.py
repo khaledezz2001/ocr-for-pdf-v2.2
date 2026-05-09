@@ -6,6 +6,9 @@ import subprocess
 import threading
 import requests
 
+from chandra.prompts import PROMPT_MAPPING
+from chandra.output import parse_markdown
+
 import runpod
 from PIL import Image
 import PIL
@@ -169,21 +172,7 @@ def start_vllm_server():
 # ===============================
 # OCR VIA vLLM
 # ===============================
-OCR_PROMPT_TEXT = (
-    "Attached is one page of a document that you must process. "
-    "Return the content using **Markdown** formatting with these strict rules:\n\n"
-    "1. Use `#` for main titles, `##` for subtitles, `###` for section headers.\n"
-    "2. Regular text paragraphs should be plain text separated by blank lines.\n"
-    "3. Lists should use Markdown bullet syntax: `- item`.\n"
-    "4. Tables must use simple HTML `<table>` tags — NO `border` attribute, "
-    "NO `<div>` wrappers, NO `data-bbox` or `data-label` attributes. "
-    "Use `<b>` for bold text inside table cells. Use `<br/>` for line breaks within cells.\n"
-    "5. Convert equations to LaTeX.\n"
-    "6. Do NOT wrap any content in `<div>` tags.\n"
-    "7. Do NOT include bounding box coordinates or layout labels.\n"
-    "8. Separate each section with a blank line (`\\n\\n`).\n\n"
-    "Output only the document content in Markdown. Do not add any commentary."
-)
+OCR_PROMPT_TEXT = PROMPT_MAPPING["ocr_layout"]
 
 def ocr_page(image: Image.Image) -> str:
     """Send a single page to the vLLM server for OCR."""
@@ -214,7 +203,9 @@ def ocr_page(image: Image.Image) -> str:
     resp = requests.post(VLLM_URL, json=payload, timeout=120)
     resp.raise_for_status()
     data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+    raw_text = data["choices"][0]["message"]["content"].strip()
+    # Convert the model's raw HTML (with divs/bbox) to clean Markdown
+    return parse_markdown(raw_text)
 
 def ocr_batch(images: list) -> list:
     """Process multiple pages sequentially via the vLLM server."""
