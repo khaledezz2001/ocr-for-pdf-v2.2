@@ -9,6 +9,9 @@ numpy<2.0
 # HTTP client for vLLM API
 requests
 
+# Chandra OCR prompts and output parsing
+chandra-ocr
+
 # HF hub for model download at build time
 huggingface_hub
 protobuf
