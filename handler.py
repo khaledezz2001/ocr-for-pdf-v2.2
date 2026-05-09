@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import io
 import time
@@ -20,7 +21,7 @@ from pdf2image import convert_from_bytes
 # ===============================
 MODEL_PATH = "/models/hf/datalab-to/chandra-ocr-2"
 MAX_PAGES = 100
-MAX_NEW_TOKENS = 1536
+MAX_NEW_TOKENS = 4096
 VLLM_PORT = 8000
 VLLM_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
 VLLM_HEALTH_URL = f"http://localhost:{VLLM_PORT}/health"
@@ -126,7 +127,7 @@ def start_vllm_server():
         "--port", str(VLLM_PORT),
         "--trust-remote-code",
         "--dtype", "bfloat16",
-        "--max-model-len", "4096",
+        "--max-model-len", "8192",
         "--max-num-seqs", "8",
         "--gpu-memory-utilization", "0.90",
     ]
@@ -205,7 +206,11 @@ def ocr_page(image: Image.Image) -> str:
     data = resp.json()
     raw_text = data["choices"][0]["message"]["content"].strip()
     # Convert the model's raw HTML (with divs/bbox) to clean Markdown
-    return parse_markdown(raw_text)
+    md = parse_markdown(raw_text)
+    # Clean up leftover HTML artifacts
+    md = re.sub(r'<table[^>]*>', '<table>', md)   # strip border="1" etc.
+    md = re.sub(r'(<br\s*/?>){2,}', '<br/>', md)  # collapse duplicate <br/>
+    return md
 
 def ocr_batch(images: list) -> list:
     """Process multiple pages sequentially via the vLLM server."""
